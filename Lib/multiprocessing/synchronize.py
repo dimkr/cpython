@@ -94,7 +94,9 @@ class SemLock(object):
     def __getstate__(self):
         assert_spawning(self)
         sl = self._semlock
-        return (Popen.duplicate_for_child(sl.handle), sl.kind, sl.maxvalue)
+        if sys.platform == 'win32':
+            return (Popen.duplicate_for_child(sl.handle), sl.kind, sl.maxvalue)
+        return (sl.handle, sl.kind, sl.maxvalue)
 
     def __setstate__(self, state):
         self._semlock = _multiprocessing.SemLock._rebuild(*state)

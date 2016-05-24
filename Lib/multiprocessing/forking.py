@@ -36,7 +36,10 @@ import os
 import sys
 import signal
 import errno
+import thread
+import time
 
+from _multiprocessing import Connection
 from multiprocessing import util, process
 
 __all__ = ['Popen', 'assert_spawning', 'exit', 'duplicate', 'close', 'ForkingPickler']
@@ -95,13 +98,34 @@ else:
         return partial(func, *args, **keywords)
     ForkingPickler.register(partial, _reduce_partial)
 
+
+#
+# _python_exe is the assumed path to the python executable.
+# People embedding Python want to modify it.
+#
+
+WINEXE = (sys.platform == 'win32' and getattr(sys, 'frozen', False))
+WINSERVICE = sys.executable.lower().endswith("pythonservice.exe")
+if WINSERVICE:
+    _python_exe = os.path.join(sys.exec_prefix, 'python.exe')
+else:
+    _python_exe = sys.executable
+
+
+#try:
+#    from cPickle import dump, load, HIGHEST_PROTOCOL
+#except ImportError:
+from pickle import load, HIGHEST_PROTOCOL
+
+def dump(obj, file, protocol=None):
+    ForkingPickler(file, protocol).dump(obj)
+
+
 #
 # Unix
 #
 
 if sys.platform != 'win32':
-    import time
-
     exit = os._exit
     duplicate = os.dup
     close = os.close
@@ -112,21 +136,40 @@ if sys.platform != 'win32':
     #
 
     class Popen(object):
+        _tls = thread._local()
 
         def __init__(self, process_obj):
             sys.stdout.flush()
             sys.stderr.flush()
             self.returncode = None
 
-            self.pid = os.fork()
-            if self.pid == 0:
-                if 'random' in sys.modules:
-                    import random
-                    random.seed()
-                code = process_obj._bootstrap()
-                sys.stdout.flush()
-                sys.stderr.flush()
-                os._exit(code)
+            # create pipe for communication with child
+            rfd, wfd = os.pipe()
+            cmd = get_command_line() + [str(rfd)]
+
+            try:
+                self.pid = os.fork()
+                if self.pid == 0:
+                    try:
+                        close(wfd)
+                        os.execv(cmd[0], cmd)
+                    finally:
+                        os._exit(1)
+            except Exception:
+                close(wfd)
+                raise
+            finally:
+                close(rfd)
+
+            # send information to child
+            prep_data = get_preparation_data(process_obj._name)
+            to_child = os.fdopen(wfd, 'wb')
+            Popen._tls._spawning = True
+            try:
+                dump(prep_data, to_child, HIGHEST_PROTOCOL)
+                dump(process_obj, to_child, HIGHEST_PROTOCOL)
+            finally:
+                to_child.close()
 
         def poll(self, flag=os.WNOHANG):
             if self.returncode is None:
@@ -148,6 +191,10 @@ if sys.platform != 'win32':
                         assert os.WIFEXITED(sts)
                         self.returncode = os.WEXITSTATUS(sts)
             return self.returncode
+
+        @staticmethod
+        def duplicate_for_child(handle):
+            return duplicate(handle)
 
         def wait(self, timeout=None):
             if timeout is None:
@@ -175,49 +222,27 @@ if sys.platform != 'win32':
 
         @staticmethod
         def thread_is_spawning():
-            return False
+            return getattr(Popen._tls, '_spawning', False)
 
 #
 # Windows
 #
 
 else:
-    import thread
     import msvcrt
     import _subprocess
-    import time
 
-    from _multiprocessing import win32, Connection, PipeConnection
+    from _multiprocessing import win32
     from .util import Finalize
-
-    #try:
-    #    from cPickle import dump, load, HIGHEST_PROTOCOL
-    #except ImportError:
-    from pickle import load, HIGHEST_PROTOCOL
-
-    def dump(obj, file, protocol=None):
-        ForkingPickler(file, protocol).dump(obj)
 
     #
     #
     #
 
     TERMINATE = 0x10000
-    WINEXE = (sys.platform == 'win32' and getattr(sys, 'frozen', False))
-    WINSERVICE = sys.executable.lower().endswith("pythonservice.exe")
 
     exit = win32.ExitProcess
     close = win32.CloseHandle
-
-    #
-    # _python_exe is the assumed path to the python executable.
-    # People embedding Python want to modify it.
-    #
-
-    if WINSERVICE:
-        _python_exe = os.path.join(sys.exec_prefix, 'python.exe')
-    else:
-        _python_exe = sys.executable
 
     def set_executable(exe):
         global _python_exe
@@ -314,123 +339,128 @@ else:
                     if self.wait(timeout=0.1) is None:
                         raise
 
-    #
-    #
-    #
+#
+#
+#
 
-    def is_forking(argv):
-        '''
-        Return whether commandline indicates we are forking
-        '''
-        if len(argv) >= 2 and argv[1] == '--multiprocessing-fork':
-            assert len(argv) == 3
-            return True
-        else:
-            return False
-
-
-    def freeze_support():
-        '''
-        Run code for process object if this in not the main process
-        '''
-        if is_forking(sys.argv):
-            main()
-            sys.exit()
+def is_forking(argv):
+    '''
+    Return whether commandline indicates we are forking
+    '''
+    if len(argv) >= 2 and argv[1] == '--multiprocessing-fork':
+        assert len(argv) == 3
+        return True
+    else:
+        return False
 
 
-    def get_command_line():
-        '''
-        Returns prefix of command line used for spawning a child process
-        '''
-        if getattr(process.current_process(), '_inheriting', False):
-            raise RuntimeError('''
-            Attempt to start a new process before the current process
-            has finished its bootstrapping phase.
-
-            This probably means that you are on Windows and you have
-            forgotten to use the proper idiom in the main module:
-
-                if __name__ == '__main__':
-                    freeze_support()
-                    ...
-
-            The "freeze_support()" line can be omitted if the program
-            is not going to be frozen to produce a Windows executable.''')
-
-        if getattr(sys, 'frozen', False):
-            return [sys.executable, '--multiprocessing-fork']
-        else:
-            prog = 'from multiprocessing.forking import main; main()'
-            opts = util._args_from_interpreter_flags()
-            return [_python_exe] + opts + ['-c', prog, '--multiprocessing-fork']
+def freeze_support():
+    '''
+    Run code for process object if this in not the main process
+    '''
+    if is_forking(sys.argv):
+        main()
+        sys.exit()
 
 
-    def main():
-        '''
-        Run code specified by data received over pipe
-        '''
-        assert is_forking(sys.argv)
+def get_command_line():
+    '''
+    Returns prefix of command line used for spawning a child process
+    '''
+    if getattr(process.current_process(), '_inheriting', False):
+        raise RuntimeError('''
+        Attempt to start a new process before the current process
+        has finished its bootstrapping phase.
 
-        handle = int(sys.argv[-1])
+        This probably means that you are on Windows and you have
+        forgotten to use the proper idiom in the main module:
+
+            if __name__ == '__main__':
+                freeze_support()
+                ...
+
+        The "freeze_support()" line can be omitted if the program
+        is not going to be frozen to produce a Windows executable.''')
+
+    if getattr(sys, 'frozen', False):
+        return [sys.executable, '--multiprocessing-fork']
+    else:
+        prog = 'from multiprocessing.forking import main; main()'
+        opts = util._args_from_interpreter_flags()
+        return [_python_exe] + opts + ['-c', prog, '--multiprocessing-fork']
+
+
+def main():
+    '''
+    Run code specified by data received over pipe
+    '''
+    assert is_forking(sys.argv)
+
+    handle = int(sys.argv[-1])
+    if sys.platform == 'win32':
         fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
         from_parent = os.fdopen(fd, 'rb')
+    else:
+        from_parent = os.fdopen(handle, 'rb')
 
-        process.current_process()._inheriting = True
-        preparation_data = load(from_parent)
-        prepare(preparation_data)
-        self = load(from_parent)
-        process.current_process()._inheriting = False
+    process.current_process()._inheriting = True
+    preparation_data = load(from_parent)
+    prepare(preparation_data)
+    self = load(from_parent)
+    process.current_process()._inheriting = False
 
-        from_parent.close()
+    from_parent.close()
 
-        exitcode = self._bootstrap()
-        exit(exitcode)
+    exitcode = self._bootstrap()
+    exit(exitcode)
 
 
-    def get_preparation_data(name):
-        '''
-        Return info about parent needed by child to unpickle process object
-        '''
-        from .util import _logger, _log_to_stderr
+def get_preparation_data(name):
+    '''
+    Return info about parent needed by child to unpickle process object
+    '''
+    from .util import _logger, _log_to_stderr
 
-        d = dict(
-            name=name,
-            sys_path=sys.path,
-            sys_argv=sys.argv,
-            log_to_stderr=_log_to_stderr,
-            orig_dir=process.ORIGINAL_DIR,
-            authkey=process.current_process().authkey,
+    d = dict(
+        name=name,
+        sys_path=sys.path,
+        sys_argv=sys.argv,
+        log_to_stderr=_log_to_stderr,
+        orig_dir=process.ORIGINAL_DIR,
+        authkey=process.current_process().authkey,
+        )
+
+    if _logger is not None:
+        d['log_level'] = _logger.getEffectiveLevel()
+
+    if not WINEXE and not WINSERVICE:
+        main_path = getattr(sys.modules['__main__'], '__file__', None)
+        if not main_path and sys.argv[0] not in ('', '-c'):
+            main_path = sys.argv[0]
+        if main_path is not None:
+            if not os.path.isabs(main_path) and \
+                                      process.ORIGINAL_DIR is not None:
+                main_path = os.path.join(process.ORIGINAL_DIR, main_path)
+            d['main_path'] = os.path.normpath(main_path)
+
+    return d
+
+#
+# Make (Pipe)Connection picklable
+#
+
+def reduce_connection(conn):
+    if not Popen.thread_is_spawning():
+        raise RuntimeError(
+            'By default %s objects can only be shared between processes\n'
+            'using inheritance' % type(conn).__name__
             )
+    return type(conn), (Popen.duplicate_for_child(conn.fileno()),
+                        conn.readable, conn.writable)
 
-        if _logger is not None:
-            d['log_level'] = _logger.getEffectiveLevel()
-
-        if not WINEXE and not WINSERVICE:
-            main_path = getattr(sys.modules['__main__'], '__file__', None)
-            if not main_path and sys.argv[0] not in ('', '-c'):
-                main_path = sys.argv[0]
-            if main_path is not None:
-                if not os.path.isabs(main_path) and \
-                                          process.ORIGINAL_DIR is not None:
-                    main_path = os.path.join(process.ORIGINAL_DIR, main_path)
-                d['main_path'] = os.path.normpath(main_path)
-
-        return d
-
-    #
-    # Make (Pipe)Connection picklable
-    #
-
-    def reduce_connection(conn):
-        if not Popen.thread_is_spawning():
-            raise RuntimeError(
-                'By default %s objects can only be shared between processes\n'
-                'using inheritance' % type(conn).__name__
-                )
-        return type(conn), (Popen.duplicate_for_child(conn.fileno()),
-                            conn.readable, conn.writable)
-
-    ForkingPickler.register(Connection, reduce_connection)
+ForkingPickler.register(Connection, reduce_connection)
+if sys.platform == 'win32':
+    from _multiprocessing import PipeConnection
     ForkingPickler.register(PipeConnection, reduce_connection)
 
 #
