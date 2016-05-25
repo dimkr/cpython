@@ -38,6 +38,7 @@ import signal
 import errno
 import thread
 import time
+import threading
 
 from _multiprocessing import Connection
 from multiprocessing import util, process
@@ -121,6 +122,24 @@ def dump(obj, file, protocol=None):
     ForkingPickler(file, protocol).dump(obj)
 
 
+class PopenBase(object):
+    _tls = thread._local()
+
+    #
+    # We define a Popen class similar to the one from subprocess, but
+    # whose constructor takes a process object as its argument.
+    #
+
+    def __init__(self, process_obj):
+        self.returncode = None
+        self._process_obj = process_obj
+        self.rfd, self.wfd = os.pipe()
+
+    def _write_prep_data(self, to_child):
+        prep_data = get_preparation_data(self._process_obj._name)
+        dump(prep_data, to_child, HIGHEST_PROTOCOL)
+        dump(self._process_obj, to_child, HIGHEST_PROTOCOL)
+
 #
 # Unix
 #
@@ -130,48 +149,54 @@ if sys.platform != 'win32':
     duplicate = os.dup
     close = os.close
 
-    #
-    # We define a Popen class similar to the one from subprocess, but
-    # whose constructor takes a process object as its argument.
-    #
+    def _child_cleanup():
+        util._run_after_forkers()
+        util._run_finalizers()
 
-    class Popen(object):
-        _tls = thread._local()
-
+    class Popen(PopenBase):
         def __init__(self, process_obj):
+            super(Popen, self).__init__(process_obj)
+
             sys.stdout.flush()
             sys.stderr.flush()
-            self.returncode = None
 
             # create pipe for communication with child
-            rfd, wfd = os.pipe()
             cmd = get_command_line()
-            cmd.append(str(rfd))
+            cmd.append(str(self.rfd))
 
             try:
                 self.pid = os.fork()
                 if self.pid == 0:
                     try:
-                        close(wfd)
-                        util._run_after_forkers()
-                        util._run_finalizers()
+                        close(self.wfd)
+
+                        # risky: we must not call any function that uses an
+                        # internal lock because the child has its private copy
+                        # of the interpreter state (i.e. non-shared mutexes and
+                        # semaphores may be locked), so we do this in a thread.
+                        # not perfect, because the risk of deadlock is still
+                        # present (i.e. deadlock of zlib's internal lock), but
+                        # a bit safer
+                        cleaner = threading.Thread(target=_child_cleanup)
+                        cleaner.start()
+                        cleaner.join(10)
+
                         os.execv(cmd[0], cmd)
                     finally:
                         os._exit(1)
             except Exception:
-                close(wfd)
+                close(self.wfd)
                 raise
             finally:
-                close(rfd)
+                close(self.rfd)
 
             # send information to child
-            prep_data = get_preparation_data(process_obj._name)
-            to_child = os.fdopen(wfd, 'wb')
+            to_child = os.fdopen(self.wfd, 'wb')
             Popen._tls._spawning = True
             try:
-                dump(prep_data, to_child, HIGHEST_PROTOCOL)
-                dump(process_obj, to_child, HIGHEST_PROTOCOL)
+                self._write_prep_data(to_child)
             finally:
+                del Popen._tls._spawning
                 to_child.close()
 
         def poll(self, flag=os.WNOHANG):
@@ -238,10 +263,6 @@ else:
     from _multiprocessing import win32
     from .util import Finalize
 
-    #
-    #
-    #
-
     TERMINATE = 0x10000
 
     exit = win32.ExitProcess
@@ -268,19 +289,17 @@ else:
     # whose constructor takes a process object as its argument.
     #
 
-    class Popen(object):
+    class Popen(PopenBase):
         '''
         Start a subprocess to run the code of a process object
         '''
-        _tls = thread._local()
-
         def __init__(self, process_obj):
-            # create pipe for communication with child
-            rfd, wfd = os.pipe()
+            super(Popen, self).__init__(process_obj)
 
             # get handle for read end of the pipe and make it inheritable
-            rhandle = duplicate(msvcrt.get_osfhandle(rfd), inheritable=True)
-            os.close(rfd)
+            rhandle = duplicate(msvcrt.get_osfhandle(self.rfd),
+                                inheritable=True)
+            os.close(self.rfd)
 
             # start process
             cmd = get_command_line() + [rhandle]
@@ -293,16 +312,13 @@ else:
 
             # set attributes of self
             self.pid = pid
-            self.returncode = None
             self._handle = hp
 
             # send information to child
-            prep_data = get_preparation_data(process_obj._name)
-            to_child = os.fdopen(wfd, 'wb')
+            to_child = os.fdopen(self.wfd, 'wb')
             Popen._tls.process_handle = int(hp)
             try:
-                dump(prep_data, to_child, HIGHEST_PROTOCOL)
-                dump(process_obj, to_child, HIGHEST_PROTOCOL)
+                self._write_prep_data(to_child)
             finally:
                 del Popen._tls.process_handle
                 to_child.close()
