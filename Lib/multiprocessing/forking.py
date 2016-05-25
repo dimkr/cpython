@@ -145,13 +145,16 @@ if sys.platform != 'win32':
 
             # create pipe for communication with child
             rfd, wfd = os.pipe()
-            cmd = get_command_line() + [str(rfd)]
+            cmd = get_command_line()
+            cmd.append(str(rfd))
 
             try:
                 self.pid = os.fork()
                 if self.pid == 0:
                     try:
                         close(wfd)
+                        util._run_after_forkers()
+                        util._run_finalizers()
                         os.execv(cmd[0], cmd)
                     finally:
                         os._exit(1)
