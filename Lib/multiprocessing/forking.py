@@ -105,7 +105,6 @@ else:
 # People embedding Python want to modify it.
 #
 
-WINEXE = (sys.platform == 'win32' and getattr(sys, 'frozen', False))
 WINSERVICE = sys.executable.lower().endswith("pythonservice.exe")
 if WINSERVICE:
     _python_exe = os.path.join(sys.exec_prefix, 'python.exe')
@@ -452,7 +451,7 @@ def get_preparation_data(name):
     if _logger is not None:
         d['log_level'] = _logger.getEffectiveLevel()
 
-    if not WINEXE and not WINSERVICE:
+    if not getattr(sys, 'frozen', False) and not WINSERVICE:
         main_path = getattr(sys.modules['__main__'], '__file__', None)
         if not main_path and sys.argv[0] not in ('', '-c'):
             main_path = sys.argv[0]
