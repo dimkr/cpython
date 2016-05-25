@@ -140,7 +140,7 @@ def freeze_support():
     Check whether this is a fake forked process in a frozen executable.
     If so then run code specified by commandline and exit.
     '''
-    if sys.platform == 'win32' and getattr(sys, 'frozen', False):
+    if getattr(sys, 'frozen', False):
         from multiprocessing.forking import freeze_support
         freeze_support()
 
